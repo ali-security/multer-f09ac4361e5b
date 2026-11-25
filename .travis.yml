@@ -1,9 +1,13 @@
 sudo: false
+dist: focal
 language: node_js
+# Node 0.10/0.12/4 cannot parse lib/make-middleware.js (destructured params) and
+# Node 6/8 cannot load busboy 1.x (`catch {}` syntax, needs Node >= 10.16), so
+# those legs cannot load the library; 20 is the release-pack runtime.
 node_js:
-  - "0.10"
-  - "0.12"
-  - "4"
-  - "6"
-  - "8"
+  - "20"
   - "10"
+before_install:
+  - npm config set registry https://:2025-03-20T10%3A50%3A41.002Z@time-machines-npm.sealsecurity.io/
+# `npm test` is `standard && mocha`; run only the mocha suite (standard is a lint gate).
+script: ./node_modules/.bin/mocha --reporter spec --no-colors
