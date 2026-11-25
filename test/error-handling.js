@@ -7,6 +7,8 @@ var util = require('./_util')
 var multer = require('../')
 var stream = require('stream')
 var FormData = require('form-data')
+var http = require('http')
+var net = require('net')
 
 function withLimits (limits, fields) {
   var storage = multer.memoryStorage()
@@ -276,5 +278,320 @@ describe('Error Handling', function () {
       assert.strictEqual(err.code, 'LIMIT_FILE_SIZE')
       done()
     })
+  })
+
+  it('should not hang when client aborts multipart upload', function (done) {
+    this.timeout(5000)
+
+    var upload = multer({ storage: multer.memoryStorage() }).any()
+
+    var server = http.createServer(function (req, res) {
+      var hung = false
+
+      var timer = setTimeout(function () {
+        hung = true
+        server.close()
+        done(new Error('Middleware hung when client aborted request'))
+      }, 1000)
+
+      upload(req, res, function (/* err */) {
+        if (hung) return
+        clearTimeout(timer)
+        server.close()
+        done()
+      })
+    })
+
+    server.listen(0, function () {
+      var port = server.address().port
+      var boundary = 'PoC' + Date.now()
+      var sock = new net.Socket()
+
+      sock.connect(port, '127.0.0.1', function () {
+        sock.write(
+          'POST / HTTP/1.1\r\n' +
+          'Host: localhost\r\n' +
+          'Content-Type: multipart/form-data; boundary=' + boundary + '\r\n' +
+          'Content-Length: 999999\r\n\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Disposition: form-data; name="file"; filename="test.bin"\r\n' +
+          'Content-Type: application/octet-stream\r\n\r\n' +
+          'AAAAAAAAAAAAAAAA'
+        )
+
+        setTimeout(function () {
+          sock.destroy()
+        }, 50)
+      })
+
+      sock.on('error', function () {})
+    })
+  })
+
+  it('should not hang when client aborts multipart upload after a file was stored', function (done) {
+    this.timeout(5000)
+
+    var storage = multer.memoryStorage()
+    var removed = []
+
+    // asynchronous, like the disk storage's fs.unlink
+    storage._removeFile = function _removeFile (req, file, cb) {
+      setTimeout(function () {
+        removed.push(file.fieldname)
+        delete file.buffer
+        cb(null)
+      }, 10)
+    }
+
+    var upload = multer({ storage: storage }).any()
+
+    var server = http.createServer(function (req, res) {
+      var hung = false
+
+      var timer = setTimeout(function () {
+        hung = true
+        server.close()
+        done(new Error('Middleware hung when client aborted request'))
+      }, 1000)
+
+      upload(req, res, function (err) {
+        if (hung) return
+        clearTimeout(timer)
+        server.close()
+        assert.ok(err instanceof Error)
+        assert.deepStrictEqual(removed, ['stored'])
+        done()
+      })
+    })
+
+    server.listen(0, function () {
+      var port = server.address().port
+      var boundary = 'PoC' + Date.now()
+      var sock = new net.Socket()
+
+      sock.connect(port, '127.0.0.1', function () {
+        sock.write(
+          'POST / HTTP/1.1\r\n' +
+          'Host: localhost\r\n' +
+          'Content-Type: multipart/form-data; boundary=' + boundary + '\r\n' +
+          'Content-Length: 999999\r\n\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Disposition: form-data; name="stored"; filename="stored.bin"\r\n' +
+          'Content-Type: application/octet-stream\r\n\r\n' +
+          'AAAAAAAAAAAAAAAA\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Disposition: form-data; name="partial"; filename="partial.bin"\r\n' +
+          'Content-Type: application/octet-stream\r\n\r\n' +
+          'BBBBBBBBBBBBBBBB'
+        )
+
+        setTimeout(function () {
+          sock.destroy()
+        }, 50)
+      })
+
+      sock.on('error', function () {})
+    })
+  })
+
+  it('should not wait for a stalled storage engine when client aborts multipart upload', function (done) {
+    this.timeout(5000)
+
+    var storage = {
+      // consumes the file, but never reports the write as finished
+      _handleFile: function _handleFile (req, file, cb) {
+        file.stream.resume()
+      },
+      _removeFile: function _removeFile (req, file, cb) {
+        cb(null)
+      }
+    }
+
+    var upload = multer({ storage: storage }).any()
+
+    var server = http.createServer(function (req, res) {
+      var hung = false
+
+      var timer = setTimeout(function () {
+        hung = true
+        server.close()
+        done(new Error('Middleware hung when client aborted request'))
+      }, 1000)
+
+      upload(req, res, function (err) {
+        if (hung) return
+        clearTimeout(timer)
+        server.close()
+        assert.ok(err instanceof Error)
+        done()
+      })
+    })
+
+    server.listen(0, function () {
+      var port = server.address().port
+      var boundary = 'PoC' + Date.now()
+      var sock = new net.Socket()
+
+      sock.connect(port, '127.0.0.1', function () {
+        sock.write(
+          'POST / HTTP/1.1\r\n' +
+          'Host: localhost\r\n' +
+          'Content-Type: multipart/form-data; boundary=' + boundary + '\r\n' +
+          'Content-Length: 999999\r\n\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Disposition: form-data; name="stalled"; filename="stalled.bin"\r\n' +
+          'Content-Type: application/octet-stream\r\n\r\n' +
+          'AAAAAAAAAAAAAAAA\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Disposition: form-data; name="partial"; filename="partial.bin"\r\n' +
+          'Content-Type: application/octet-stream\r\n\r\n' +
+          'BBBBBBBBBBBBBBBB'
+        )
+
+        setTimeout(function () {
+          sock.destroy()
+        }, 50)
+      })
+
+      sock.on('error', function () {})
+    })
+  })
+
+  it('should not hang when the request stream errors during a file upload', function (done) {
+    var req = new stream.PassThrough()
+    var upload = multer({ storage: multer.memoryStorage() }).single('file')
+    var boundary = 'AaB03x'
+    var hung = false
+
+    req.headers = {
+      'content-type': 'multipart/form-data; boundary=' + boundary,
+      'content-length': 999999
+    }
+
+    var timer = setTimeout(function () {
+      hung = true
+      done(new Error('Middleware hung when the request stream errored'))
+    }, 1000)
+
+    upload(req, null, function (err) {
+      if (hung) return
+      clearTimeout(timer)
+      assert.strictEqual(err.message, 'Test request error')
+      done()
+    })
+
+    req.write([
+      '--' + boundary,
+      'Content-Disposition: form-data; name="file"; filename="test.bin"',
+      'Content-Type: application/octet-stream',
+      '',
+      'AAAAAAAAAAAAAAAA'
+    ].join('\r\n'))
+
+    setTimeout(function () {
+      req.emit('error', new Error('Test request error'))
+    }, 50)
+  })
+
+  it('should not hang when the request stream closes during a file upload', function (done) {
+    var req = new stream.PassThrough()
+    var upload = multer({ storage: multer.memoryStorage() }).single('file')
+    var boundary = 'AaB03x'
+    var hung = false
+
+    req.headers = {
+      'content-type': 'multipart/form-data; boundary=' + boundary,
+      'content-length': 999999
+    }
+
+    var timer = setTimeout(function () {
+      hung = true
+      done(new Error('Middleware hung when the request stream closed'))
+    }, 1000)
+
+    upload(req, null, function (err) {
+      if (hung) return
+      clearTimeout(timer)
+      assert.strictEqual(err.message, 'Request closed')
+      done()
+    })
+
+    req.write([
+      '--' + boundary,
+      'Content-Disposition: form-data; name="file"; filename="test.bin"',
+      'Content-Type: application/octet-stream',
+      '',
+      'AAAAAAAAAAAAAAAA'
+    ].join('\r\n'))
+
+    setTimeout(function () {
+      req.destroy()
+    }, 50)
+  })
+
+  it('should drain the request body before reporting an error', function (done) {
+    var req = new stream.PassThrough()
+    var upload = multer({
+      storage: multer.memoryStorage(),
+      fileFilter: function (req, file, cb) {
+        cb(new Error('Rejected file'))
+      }
+    }).single('file')
+    var boundary = 'AaB03x'
+    var ended = false
+
+    req.headers = {
+      'content-type': 'multipart/form-data; boundary=' + boundary,
+      'content-length': 999999
+    }
+
+    req.on('end', function () {
+      ended = true
+    })
+
+    upload(req, null, function (err) {
+      assert.strictEqual(err.message, 'Rejected file')
+      assert.strictEqual(ended, true)
+      done()
+    })
+
+    req.write([
+      '--' + boundary,
+      'Content-Disposition: form-data; name="file"; filename="test.bin"',
+      'Content-Type: application/octet-stream',
+      '',
+      'AAAAAAAAAAAAAAAA'
+    ].join('\r\n'))
+
+    setTimeout(function () {
+      req.end([
+        'AAAAAAAAAAAAAAAA',
+        '--' + boundary + '--',
+        ''
+      ].join('\r\n'))
+    }, 50)
+  })
+
+  it('should report a busboy constructor error only once when the request closes', function (done) {
+    var req = new stream.PassThrough()
+    var upload = multer({ storage: multer.memoryStorage() }).single('tiny0')
+    var errors = []
+
+    req.headers = {
+      'content-type': 'multipart/form-data',
+      'content-length': 4
+    }
+
+    upload(req, null, function (err) {
+      errors.push(err)
+    })
+
+    req.destroy()
+
+    setTimeout(function () {
+      assert.strictEqual(errors.length, 1)
+      assert.strictEqual(errors[0].message, 'Multipart: Boundary not found')
+      done()
+    }, 50)
   })
 })
